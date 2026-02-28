@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment variables
+.env
+.env.*
+
+# Runtime files
+.call_id
+.highlights.json
+
+# Model weights (auto-downloaded on first run)
+*.pt

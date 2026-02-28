@@ -1,0 +1,420 @@
+"""
+SportsProcessor — Custom sports intelligence video processor.
+
+This is what makes Vision Agents the HERO of PlayByt.
+
+Raw YOLO output: "17 keypoints per person detected"
+SportsProcessor output: "3 players in defensive third showing fatigue,
+                          high pressing intensity on the right channel,
+                          estimated 4-3-3 formation"
+
+The processor:
+1. Runs YOLO pose detection on each frame (reuses YOLOPoseProcessor internals)
+2. Converts raw keypoint data into structured football intelligence
+3. Draws a real-time HUD overlay on the video feed
+4. Stores analysis for tool calling — Gemini accesses it via get_field_analysis()
+
+Without this, Gemini is just watching TV like anyone else.
+With this, Gemini has superhuman spatial data no human eye can compute in real time.
+"""
+
+import asyncio
+import logging
+import math
+import time
+from typing import Any, Dict, List, Optional
+
+import av
+import cv2
+import numpy as np
+from vision_agents.core.processors.base_processor import VideoProcessorPublisher
+from vision_agents.core.utils.video_forwarder import VideoForwarder
+from vision_agents.core.utils.video_track import QueuedVideoTrack
+from vision_agents.plugins.ultralytics import YOLOPoseProcessor
+
+logger = logging.getLogger(__name__)
+
+# ── COCO Pose Keypoint Indices ──────────────────────────────────────────────
+NOSE = 0
+L_SHOULDER, R_SHOULDER = 5, 6
+L_ELBOW, R_ELBOW = 7, 8
+L_WRIST, R_WRIST = 9, 10
+L_HIP, R_HIP = 11, 12
+L_KNEE, R_KNEE = 13, 14
+L_ANKLE, R_ANKLE = 15, 16
+
+
+class SportsProcessor(VideoProcessorPublisher):
+    """
+    Custom video processor that wraps YOLO and adds structured sports intelligence.
+
+    Per frame it computes:
+    - Player count and spatial zone distribution
+    - Fatigue indicators from spine posture angles
+    - Pressing intensity from player clustering metrics
+    - Formation estimate (e.g. 4-3-3)
+    - Dominant side of play
+
+    Draws a compact HUD overlay so Gemini can SEE the computed data.
+    Stores latest analysis dict for tool calling access.
+    """
+
+    name = "sports_intelligence"
+
+    def __init__(
+        self,
+        model_path: str = "yolo11n-pose.pt",
+        conf_threshold: float = 0.5,
+        fps: int = 3,
+    ):
+        # Internal YOLO processor — we call its methods directly, not via the SDK pipeline
+        self._yolo = YOLOPoseProcessor(
+            model_path=model_path,
+            conf_threshold=conf_threshold,
+            fps=fps,
+            enable_hand_tracking=False,
+            enable_wrist_highlights=False,
+        )
+        self._video_track = QueuedVideoTrack()
+        self._video_forwarder: Optional[VideoForwarder] = None
+        self._shutdown = False
+        self.fps = fps
+        self.conf_threshold = conf_threshold
+
+        # Latest analysis — read by tool calling functions in main.py
+        self.latest_analysis: Dict[str, Any] = {}
+        self._analysis_history: List[Dict[str, Any]] = []
+
+        logger.info("⚽ Sports Intelligence Processor initialized")
+
+    # ── Video Pipeline ──────────────────────────────────────────────────────
+
+    async def process_video(
+        self,
+        incoming_track: Any,
+        participant_id: Optional[str],
+        shared_forwarder: Optional[VideoForwarder] = None,
+    ) -> None:
+        """Set up the video processing pipeline."""
+        if self._video_forwarder is not None:
+            await self._video_forwarder.remove_frame_handler(self._process_frame)
+
+        logger.info(f"⚽ Starting Sports Intelligence processing at {self.fps} FPS")
+        self._video_forwarder = (
+            shared_forwarder
+            if shared_forwarder
+            else VideoForwarder(
+                incoming_track,
+                max_buffer=self.fps,
+                fps=self.fps,
+                name="sports_intelligence_forwarder",
+            )
+        )
+        self._video_forwarder.add_frame_handler(
+            self._process_frame, fps=float(self.fps), name="sports_intelligence"
+        )
+
+    async def _process_frame(self, frame: av.VideoFrame) -> None:
+        """Process a single frame: YOLO → analysis → HUD → publish."""
+        if self._shutdown:
+            return
+
+        try:
+            frame_array = frame.to_ndarray(format="rgb24")
+
+            # 1. Run YOLO pose detection — get annotated frame + structured pose data
+            annotated, pose_data = await self._yolo.add_pose_to_ndarray(frame_array)
+
+            # 2. Compute sports intelligence from pose keypoints
+            h, w = annotated.shape[:2]
+            analysis = self._compute_analysis(pose_data, w, h)
+
+            # 3. Store for tool calling
+            self.latest_analysis = analysis
+            self._analysis_history.append(analysis)
+            if len(self._analysis_history) > 30:  # Keep ~10 seconds at 3fps
+                self._analysis_history = self._analysis_history[-30:]
+
+            # 4. Draw HUD overlay on the annotated frame
+            self._draw_hud(annotated, analysis)
+
+            # 5. Publish the processed frame
+            processed = av.VideoFrame.from_ndarray(annotated, format="rgb24")
+            await self._video_track.add_frame(processed)
+
+        except Exception as e:
+            logger.exception(f"⚽ Frame processing failed: {e}")
+            await self._video_track.add_frame(frame)
+
+    def publish_video_track(self) -> QueuedVideoTrack:
+        """Return the output video track."""
+        return self._video_track
+
+    async def stop_processing(self) -> None:
+        """Stop processing video."""
+        if self._video_forwarder is not None:
+            await self._video_forwarder.remove_frame_handler(self._process_frame)
+            self._video_forwarder = None
+            logger.info("🛑 Sports Intelligence processing stopped")
+
+    async def close(self) -> None:
+        """Clean up resources."""
+        self._shutdown = True
+        await self.stop_processing()
+        await self._yolo.close()
+        logger.info("🛑 Sports Intelligence Processor closed")
+
+    # ── Analysis Engine ─────────────────────────────────────────────────────
+
+    def _compute_analysis(
+        self, pose_data: Dict[str, Any], frame_w: int, frame_h: int
+    ) -> Dict[str, Any]:
+        """Convert raw YOLO keypoints into structured sports intelligence."""
+        persons = pose_data.get("persons", [])
+
+        empty_zones = {
+            "left": 0, "center": 0, "right": 0,
+            "def_third": 0, "mid_third": 0, "att_third": 0,
+        }
+
+        if not persons:
+            return {
+                "timestamp": time.time(),
+                "player_count": 0,
+                "zones": empty_zones,
+                "fatigue_flags": [],
+                "pressing_intensity": "none",
+                "formation": "N/A",
+                "dominant_side": "balanced",
+                "positions": [],
+            }
+
+        # Extract player positions (hip midpoint = player center)
+        positions: List[Dict[str, Any]] = []
+        fatigue_flags: List[Dict[str, Any]] = []
+
+        for person in persons:
+            kpts = person.get("keypoints", [])
+            if len(kpts) < 17:
+                continue
+
+            l_hip = kpts[L_HIP]
+            r_hip = kpts[R_HIP]
+
+            if l_hip[2] > self.conf_threshold and r_hip[2] > self.conf_threshold:
+                cx = (l_hip[0] + r_hip[0]) / 2
+                cy = (l_hip[1] + r_hip[1]) / 2
+                positions.append({
+                    "x": cx / frame_w,  # Normalized 0-1
+                    "y": cy / frame_h,
+                    "id": person["person_id"],
+                })
+
+            # Fatigue detection: forward lean from spine angle
+            l_sh = kpts[L_SHOULDER]
+            r_sh = kpts[R_SHOULDER]
+            if all(k[2] > self.conf_threshold for k in [l_sh, r_sh, l_hip, r_hip]):
+                sh_mid_x = (l_sh[0] + r_sh[0]) / 2
+                sh_mid_y = (l_sh[1] + r_sh[1]) / 2
+                hip_mid_x = (l_hip[0] + r_hip[0]) / 2
+                hip_mid_y = (l_hip[1] + r_hip[1]) / 2
+
+                # Spine angle relative to vertical
+                dx = sh_mid_x - hip_mid_x
+                dy = hip_mid_y - sh_mid_y  # Flip Y (screen coords inverted)
+
+                if dy > 0:
+                    spine_angle = math.degrees(math.atan2(abs(dx), dy))
+                else:
+                    spine_angle = 90.0
+
+                if spine_angle > 25:  # More than 25° forward lean = fatigue signal
+                    fatigue_flags.append({
+                        "player_id": person["person_id"],
+                        "spine_angle": round(spine_angle, 1),
+                        "severity": "high" if spine_angle > 40 else "moderate",
+                    })
+
+        # Zone distribution
+        zones = dict(empty_zones)
+        for pos in positions:
+            if pos["x"] < 0.33:
+                zones["left"] += 1
+            elif pos["x"] < 0.67:
+                zones["center"] += 1
+            else:
+                zones["right"] += 1
+
+            if pos["y"] < 0.33:
+                zones["def_third"] += 1
+            elif pos["y"] < 0.67:
+                zones["mid_third"] += 1
+            else:
+                zones["att_third"] += 1
+
+        # Dominant side
+        if zones["left"] > zones["right"] + 1:
+            dominant_side = "left"
+        elif zones["right"] > zones["left"] + 1:
+            dominant_side = "right"
+        else:
+            dominant_side = "balanced"
+
+        # Pressing intensity (average pairwise distance)
+        pressing = "none"
+        if len(positions) >= 2:
+            distances = []
+            for i in range(len(positions)):
+                for j in range(i + 1, len(positions)):
+                    d = math.sqrt(
+                        (positions[i]["x"] - positions[j]["x"]) ** 2
+                        + (positions[i]["y"] - positions[j]["y"]) ** 2
+                    )
+                    distances.append(d)
+            avg_dist = sum(distances) / len(distances)
+            if avg_dist < 0.15:
+                pressing = "high"
+            elif avg_dist < 0.25:
+                pressing = "medium"
+            else:
+                pressing = "low"
+
+        # Formation estimate
+        formation = self._estimate_formation(positions)
+
+        return {
+            "timestamp": time.time(),
+            "player_count": len(positions),
+            "zones": zones,
+            "fatigue_flags": fatigue_flags,
+            "pressing_intensity": pressing,
+            "formation": formation,
+            "dominant_side": dominant_side,
+            "positions": positions,
+        }
+
+    def _estimate_formation(self, positions: List[Dict[str, Any]]) -> str:
+        """Rough formation estimate from player vertical distribution."""
+        if len(positions) < 4:
+            return "N/A"
+
+        sorted_pos = sorted(positions, key=lambda p: p["y"])
+        n = len(sorted_pos)
+        third = max(1, n // 3)
+
+        defense = len(sorted_pos[:third])
+        midfield = len(sorted_pos[third : third * 2])
+        attack = len(sorted_pos[third * 2 :])
+
+        return f"{defense}-{midfield}-{attack}"
+
+    def get_trend(self) -> Dict[str, Any]:
+        """Compute trends from analysis history (called by tool functions)."""
+        if len(self._analysis_history) < 3:
+            return {"trend": "insufficient_data"}
+
+        recent = self._analysis_history[-10:]
+        earlier = self._analysis_history[:-10] if len(self._analysis_history) > 10 else []
+
+        avg_recent_players = sum(a["player_count"] for a in recent) / len(recent)
+        fatigue_count = sum(len(a["fatigue_flags"]) for a in recent)
+
+        pressing_counts = {"high": 0, "medium": 0, "low": 0, "none": 0}
+        for a in recent:
+            pressing_counts[a["pressing_intensity"]] += 1
+        dominant_pressing = max(pressing_counts, key=pressing_counts.get)  # type: ignore
+
+        trend: Dict[str, Any] = {
+            "avg_players_visible": round(avg_recent_players, 1),
+            "fatigue_events_last_10_frames": fatigue_count,
+            "dominant_pressing": dominant_pressing,
+            "frames_analyzed": len(self._analysis_history),
+        }
+
+        if earlier:
+            avg_earlier = sum(a["player_count"] for a in earlier) / len(earlier)
+            if avg_recent_players > avg_earlier + 1:
+                trend["player_movement"] = "more players entering frame"
+            elif avg_recent_players < avg_earlier - 1:
+                trend["player_movement"] = "players leaving frame"
+            else:
+                trend["player_movement"] = "stable"
+
+        return trend
+
+    # ── HUD Overlay ─────────────────────────────────────────────────────────
+
+    def _draw_hud(self, frame: np.ndarray, analysis: Dict[str, Any]) -> None:
+        """Draw a compact intelligence HUD in the top-left of the frame."""
+        h, w = frame.shape[:2]
+
+        # Semi-transparent background
+        hud_w, hud_h = 230, 130
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (8, 8), (8 + hud_w, 8 + hud_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+
+        # Border
+        cv2.rectangle(frame, (8, 8), (8 + hud_w, 8 + hud_h), (0, 255, 136), 1)
+
+        y = 24
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        sm = 0.32
+        lg = 0.38
+
+        # Title
+        cv2.putText(frame, "PLAYBYT INTELLIGENCE", (14, y), font, sm, (0, 255, 136), 1, cv2.LINE_AA)
+        y += 18
+
+        # Player count
+        pc = analysis.get("player_count", 0)
+        cv2.putText(frame, f"Players Tracked: {pc}", (14, y), font, lg, (255, 255, 255), 1, cv2.LINE_AA)
+        y += 18
+
+        # Zones
+        z = analysis.get("zones", {})
+        cv2.putText(
+            frame,
+            f"L:{z.get('left',0)}  C:{z.get('center',0)}  R:{z.get('right',0)}",
+            (14, y), font, sm, (200, 200, 200), 1, cv2.LINE_AA,
+        )
+        y += 14
+        cv2.putText(
+            frame,
+            f"Def:{z.get('def_third',0)}  Mid:{z.get('mid_third',0)}  Att:{z.get('att_third',0)}",
+            (14, y), font, sm, (200, 200, 200), 1, cv2.LINE_AA,
+        )
+        y += 18
+
+        # Formation
+        formation = analysis.get("formation", "N/A")
+        cv2.putText(frame, f"Formation: {formation}", (14, y), font, lg, (68, 136, 255), 1, cv2.LINE_AA)
+        y += 18
+
+        # Pressing
+        pressing = analysis.get("pressing_intensity", "none")
+        press_colors = {"high": (0, 255, 136), "medium": (0, 200, 255), "low": (150, 150, 150), "none": (100, 100, 100)}
+        cv2.putText(
+            frame, f"Pressing: {pressing.upper()}", (14, y), font, lg,
+            press_colors.get(pressing, (150, 150, 150)), 1, cv2.LINE_AA,
+        )
+
+        # Fatigue alerts (bottom-left)
+        fatigue = analysis.get("fatigue_flags", [])
+        if fatigue:
+            fy = h - 20
+            for f in fatigue[-3:]:  # Show up to 3 latest
+                sev_color = (0, 0, 255) if f["severity"] == "high" else (0, 165, 255)
+                text = f"! Player {f['player_id']+1} fatigue ({f['spine_angle']}deg)"
+                # Background for readability
+                (tw, th), _ = cv2.getTextSize(text, font, sm, 1)
+                cv2.rectangle(frame, (12, fy - th - 2), (16 + tw, fy + 4), (0, 0, 0), -1)
+                cv2.putText(frame, text, (14, fy), font, sm, sev_color, 1, cv2.LINE_AA)
+                fy -= 20
+
+        # Dominant side indicator (top-right)
+        side = analysis.get("dominant_side", "balanced")
+        if side != "balanced":
+            side_text = f">> {side.upper()} OVERLOAD"
+            (tw, _), _ = cv2.getTextSize(side_text, font, sm, 1)
+            cv2.putText(frame, side_text, (w - tw - 14, 24), font, sm, (255, 170, 0), 1, cv2.LINE_AA)

@@ -1,0 +1,13 @@
+[project]
+name = "playbyt"
+version = "0.1.0"
+description = "PlayByt - Real-Time AI Sports Analyst powered by Vision Agents"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "vision-agents[gemini,getstream,ultralytics]>=0.3.8",
+    "python-dotenv>=1.0.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "pyjwt>=2.9.0",
+]

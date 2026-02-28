@@ -1,0 +1,41 @@
+/* PlayByt — Dark Sports Dashboard */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --bg-primary: #0a0a0f;
+  --bg-secondary: #12121a;
+  --bg-card: #1a1a26;
+  --bg-card-hover: #1e1e2e;
+  --accent-green: #00ff88;
+  --accent-blue: #4488ff;
+  --accent-orange: #ff6b35;
+  --accent-purple: #9966ff;
+  --text-primary: #f0f0f8;
+  --text-secondary: #888899;
+  --border: rgba(255, 255, 255, 0.08);
+  --shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
+}
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+#root { min-height: 100vh; }
+
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: var(--bg-secondary); }
+::-webkit-scrollbar-thumb { background: var(--accent-green); border-radius: 2px; }
+
+.str-video__participant-view { border-radius: 12px !important; overflow: hidden !important; }
+.str-video__call-controls { background: var(--bg-card) !important; border-top: 1px solid var(--border) !important; }
+
+button { cursor: pointer; border: none; outline: none; font-family: inherit; }
+input { font-family: inherit; }
