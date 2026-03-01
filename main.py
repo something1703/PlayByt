@@ -130,6 +130,14 @@ game_state: dict = {
     "start_time": None,
 }
 
+# ── Restart backoff — prevents crash-reconnect storm ────────────────────
+# Runner calls join_call again immediately on any exception.
+# We track restart count and sleep with exponential backoff so a persistent
+# Gemini 1011 / service-unavailable doesn't spin-log 23M lines.
+_restart_count: int = 0
+_restart_last: float = 0.0
+_RESTART_DELAYS = [0, 5, 15, 30, 60, 120, 300]  # seconds — cap at 5 min
+
 # ── Gemini Send Lock ──────────────────────────────────────────────────
 # Prevents concurrent sends to the Gemini WebSocket which causes 1011 crashes.
 # All simple_response() calls must acquire this lock before sending.
@@ -824,6 +832,22 @@ def _setup_transcript_capture(agent: Agent) -> None:
 # ── Call Lifecycle ──────────────────────────────────────────────────────
 async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> None:
     """Join a Stream call and run until it ends."""
+    global _restart_count, _restart_last
+
+    # ── Exponential backoff on repeated restarts ──────────────────────────────
+    # If the Runner is restarting us quickly (within 30s), back off so a
+    # persistent Gemini 1011 / service-unavailable doesn't flood the log.
+    now = time.time()
+    if _restart_count > 0 and (now - _restart_last) < 30:
+        delay = _RESTART_DELAYS[min(_restart_count, len(_RESTART_DELAYS) - 1)]
+        logger.warning(
+            "Gemini restart #%d — backing off %ds before reconnecting…",
+            _restart_count, delay,
+        )
+        await asyncio.sleep(delay)
+    _restart_last = time.time()
+    _restart_count += 1
+    # ─────────────────────────────────────────────────────────────────────────
     _persist_call_id(call_type, call_id)
     game_state["start_time"] = time.time()
     game_state["highlights"] = []
@@ -842,6 +866,7 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
             break
 
     async with agent.join(call):
+        _restart_count = 0  # successful connection — reset backoff
         _update_status(gemini="connected", yolo="active")
         _setup_transcript_capture(agent)
 
