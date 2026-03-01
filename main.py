@@ -23,6 +23,9 @@ from getstream.models import CallRequest
 import httpx
 from vision_agents.core import Agent, Runner, User
 from vision_agents.core.agents import AgentLauncher
+from vision_agents.core.llm.events import (
+    RealtimeAgentSpeechTranscriptionEvent,
+)
 from vision_agents.plugins import gemini, getstream
 from vision_agents.plugins.getstream.stream_edge_transport import StreamEdge
 
@@ -126,6 +129,58 @@ _io_executor = concurrent.futures.ThreadPoolExecutor(
 _transcript_lines: list[dict] = []
 _transcript_counter = 0
 
+# ── Transcript Chunk Buffer (sentence-level batching) ──────────────────
+# The SDK fires RealtimeAgentSpeechTranscriptionEvent per streaming chunk
+# (1-2 words each).  We accumulate chunks here and only write a transcript
+# entry when a sentence boundary is detected or a silence gap elapses.
+_chunk_buffer: list[str] = []
+_chunk_flush_task: asyncio.Task | None = None
+_CHUNK_FLUSH_DELAY = 2.5  # seconds of silence before flushing partial sentence
+
+
+async def _flush_chunk_buffer() -> None:
+    """Flush accumulated speech chunks into a single transcript entry."""
+    global _chunk_flush_task
+    if not _chunk_buffer:
+        return
+    text = " ".join(_chunk_buffer).strip()
+    _chunk_buffer.clear()
+    _chunk_flush_task = None
+    if text:
+        await _append_transcript(text, source="agent")
+
+
+async def _buffer_chunk(text: str) -> None:
+    """
+    Buffer a streaming speech chunk.  Flushes to transcript when:
+      - A sentence boundary is detected (. ! ?)
+      - OR a 2.5-second gap occurs (agent stopped talking mid-sentence)
+    """
+    global _chunk_flush_task
+    cleaned = text.strip()
+    if not cleaned:
+        return
+
+    _chunk_buffer.append(cleaned)
+
+    # Cancel any pending flush timer — we're still receiving chunks
+    if _chunk_flush_task and not _chunk_flush_task.done():
+        _chunk_flush_task.cancel()
+
+    # Check if the accumulated text ends with a sentence boundary
+    full_text = " ".join(_chunk_buffer)
+    if full_text.rstrip().endswith((".", "!", "?", "…")):
+        await _flush_chunk_buffer()
+    else:
+        # Schedule a delayed flush in case the agent stops mid-sentence
+        _chunk_flush_task = asyncio.ensure_future(_delayed_flush())
+
+
+async def _delayed_flush() -> None:
+    """Wait for the silence gap, then flush whatever is buffered."""
+    await asyncio.sleep(_CHUNK_FLUSH_DELAY)
+    await _flush_chunk_buffer()
+
 
 async def _append_transcript(text: str, source: str = "agent") -> None:
     """Add a transcript line and persist to disk for the API."""
@@ -214,7 +269,7 @@ def _save_highlights() -> None:
 async def create_agent(**kwargs) -> Agent:
     """Create the PlayByt sports analyst agent with tools."""
 
-    llm = gemini.Realtime(fps=2)
+    llm = gemini.Realtime(fps=5)
 
     # ── Tool: Log Highlight ─────────────────────────────────────────
     @llm.register_function(
@@ -458,100 +513,202 @@ async def create_agent(**kwargs) -> Agent:
 
 
 # ── Proactive Commentary Loop ──────────────────────────────────────────
+
+
+async def _send_to_gemini(agent: Agent, prompt: str, label: str) -> bool:
+    """
+    Send a text prompt to Gemini through the shared send lock.
+    Returns True if the prompt was delivered, False otherwise.
+    Sets backoff on crash.
+    """
+    global _backoff_until
+    if time.time() < _backoff_until:
+        return False
+    try:
+        async with _gemini_send_lock:
+            await asyncio.wait_for(
+                agent.llm.simple_response(text=prompt),
+                timeout=12.0,
+            )
+        _update_status(last_commentary=time.time())
+        logger.info("🎙️ %s delivered", label)
+        return True
+    except asyncio.TimeoutError:
+        logger.debug("%s timed out", label)
+        return False
+    except Exception as e:
+        err_str = str(e)
+        if "1008" in err_str or "1011" in err_str or "ConnectionClosed" in type(e).__name__:
+            _backoff_until = time.time() + 25
+            logger.warning("🔴 Gemini crash (%s) — backing off 25s", type(e).__name__)
+        else:
+            logger.debug("%s failed: %s", label, e)
+        return False
+
+
+async def _event_watcher(agent: Agent, sports: SportsProcessor) -> None:
+    """
+    Watch the SportsProcessor event queue and fire commentary IMMEDIATELY
+    when a controversy is detected. This is what makes PlayByt reactive —
+    catching the exact moment something changes, faster than any human.
+    """
+    global _backoff_until
+    await asyncio.sleep(20)  # Let agent fully stabilize first
+    logger.info("⚡ Event watcher started — will react to controversies instantly")
+
+    while True:
+        try:
+            # Block until a controversy event arrives (with timeout so we can check cancel)
+            try:
+                alert = await asyncio.wait_for(sports._event_queue.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                continue  # No event — loop back and wait again
+
+            # Respect backoff
+            if time.time() < _backoff_until:
+                continue
+
+            prompt = (
+                f"[REAL-TIME ALERT] {alert['title']}: {alert['description']}. "
+                f"This JUST happened on screen. React immediately — what does this mean "
+                f"tactically? Keep it under 2 sentences. Be excited if it's a big change."
+            )
+            await _send_to_gemini(agent, prompt, f"Event: {alert['title']}")
+
+        except asyncio.CancelledError:
+            logger.info("⚡ Event watcher cancelled")
+            return
+        except Exception as e:
+            logger.debug("Event watcher error: %s", e)
+
+
 async def _commentary_loop(agent: Agent, sports: SportsProcessor) -> None:
     """
-    Drive continuous proactive commentary every 15-20 seconds.
-    This is what makes PlayByt a COMMENTATOR instead of a passive observer.
-    
-    Every tick:
-    1. Read latest YOLO analysis
-    2. Build a context prompt with real data
-    3. Send it to Gemini as a nudge → Gemini speaks
-    4. Log the transcript for the frontend
+    Drive continuous proactive commentary every ~15 seconds.
+    This is the HEARTBEAT — the agent always talks, never goes silent.
+
+    PRIORITY: Questions are answered FIRST. If a user question is pending,
+    it takes the tick instead of commentary.  This ensures questions never
+    get starved by the constant commentary stream.
+
+    Two commentary modes:
+    - YOLO data available → include key data AND reference the HUD overlay
+    - YOLO data unavailable → vision-only commentary from the raw video feed
     """
     global _backoff_until
     _update_status(commentary_loop="starting")
-    await asyncio.sleep(15)  # Let Gemini session stabilize before first commentary
+    await asyncio.sleep(15)  # Let Gemini session stabilize
     _update_status(commentary_loop="active")
-    logger.info("🎙️ Commentary loop started — agent will speak every ~12s")
+    logger.info("🎙️ Commentary loop started — agent will speak every ~15s")
 
     tick = 0
     while True:
         try:
             tick += 1
 
-            # Skip tick if recovering from a Gemini WebSocket crash (1011)
+            # Skip tick if recovering from a Gemini WebSocket crash
             if time.time() < _backoff_until:
                 logger.debug("Commentary tick #%d skipped (backoff)", tick)
                 await asyncio.sleep(15)
                 continue
 
+            # ── PRIORITY: Answer pending questions FIRST ──────────────
+            question_handled = False
+            try:
+                questions = _safe_read_json(QUESTIONS_FILE, fallback=[])
+                pending = [q for q in questions if not q.get("answered")]
+                if pending:
+                    q = pending[0]
+                    q["answered"] = True
+                    user = q.get("user", "Fan")
+                    question_text = q.get("question", "")
+                    logger.info("❓ Commentary tick yielded to question from %s: %s", user, question_text)
+                    await _append_transcript(question_text, source="user")
+
+                    prompt = (
+                        f"[USER QUESTION from {user}]: \"{question_text}\"\n"
+                        f"Answer this question directly and helpfully. "
+                        f"If it's about the game, use what you see on screen "
+                        f"and the data from the HUD overlay. "
+                        f"If it's about stats or players, give your best answer. "
+                        f"Keep it under 3 sentences."
+                    )
+                    sent = await _send_to_gemini(agent, prompt, f"Question from {user}")
+                    if sent:
+                        question_handled = True
+                    _safe_write_json(QUESTIONS_FILE, questions)
+            except Exception as e:
+                logger.debug("Question check in commentary loop error: %s", e)
+
+            if question_handled:
+                await asyncio.sleep(15)
+                continue
+
+            # ── Commentary ────────────────────────────────────────────
             analysis = sports.latest_analysis
             player_count = analysis.get("player_count", 0) if analysis else 0
 
             if player_count > 0:
-                # Build a rich context nudge with real YOLO data
-                zones = analysis.get("zones", {})
-                fatigue = analysis.get("fatigue_flags", [])
-                formation = analysis.get("formation", "N/A")
-                pressing = analysis.get("pressing_intensity", "none")
+                # ── Mode 1: YOLO data available ──
+                # Include key data points in text AND reference the visual HUD.
+                # Gemini performs best with BOTH text data + visual overlay.
+                formation = analysis.get("formation", "unknown")
+                pressing = analysis.get("pressing_intensity", "unknown")
                 dominant = analysis.get("dominant_side", "balanced")
+                zones = analysis.get("zones", {})
+                zone_lr = f"L:{zones.get('left', 0)} C:{zones.get('center', 0)} R:{zones.get('right', 0)}"
+                thirds = f"Def:{zones.get('def_third', 0)} Mid:{zones.get('mid_third', 0)} Att:{zones.get('att_third', 0)}"
 
-                # Vary the prompt to get different observations each tick
+                fatigue_info = ""
+                fatigue_flags = analysis.get("fatigue_flags", [])
+                if fatigue_flags:
+                    fatigue_info = f" Fatigue alert: {len(fatigue_flags)} player(s) showing signs."
+
                 prompts = [
                     (
-                        f"[LIVE DATA] {player_count} players tracked. "
-                        f"Formation {formation}. Pressing {pressing}. "
-                        f"Zones L:{zones.get('left',0)} C:{zones.get('center',0)} R:{zones.get('right',0)}. "
-                        f"Give a sharp 1-sentence tactical observation about what you see on screen right now."
+                        f"[LIVE DATA] {player_count} players tracked | Formation: {formation} | "
+                        f"Pressing: {pressing} | Zones: {zone_lr} | Thirds: {thirds} | "
+                        f"Dominant side: {dominant}.{fatigue_info}\n"
+                        f"The PLAYBYT HUD overlay on screen shows this data visually. "
+                        f"Give one sharp tactical insight about what this means for the match. "
+                        f"Be specific — mention formations, pressing, or positioning. One sentence."
                     ),
                     (
-                        f"[LIVE DATA] Dominant side: {dominant}. "
-                        f"Thirds — Def:{zones.get('def_third',0)} Mid:{zones.get('mid_third',0)} Att:{zones.get('att_third',0)}. "
-                        f"Fatigue flags: {len(fatigue)}. "
-                        f"What's the most interesting thing happening on screen right now? One sentence."
+                        f"[LIVE DATA] {player_count} players | {formation} formation | "
+                        f"Pressing {pressing} | {dominant} side dominant.{fatigue_info}\n"
+                        f"Look at the HUD and the match action. "
+                        f"What would a casual viewer miss right now? "
+                        f"Point out something only an analyst would notice. One sentence."
                     ),
                     (
-                        f"[LIVE DATA] {player_count} visible. Pressing {pressing}. "
-                        f"Look at the screen — describe the current play in 1-2 sentences. "
-                        f"What did the broadcast miss? Use the HUD numbers."
+                        f"[LIVE DATA] Zones: {zone_lr} | Thirds: {thirds} | "
+                        f"Formation: {formation} | Pressing: {pressing}.{fatigue_info}\n"
+                        f"Combine this data with what you see on screen. "
+                        f"What's the tactical story? Are they attacking, defending, transitioning? "
+                        f"One energetic sentence."
                     ),
                 ]
-
-                # Also sprinkle in controversy/highlight nudges
-                recent_controversies = sports.get_latest_controversies(limit=1)
-                if recent_controversies and tick % 3 == 0:
-                    c = recent_controversies[-1]
-                    prompt = (
-                        f"[ALERT] {c['title']}: {c['description']}. "
-                        f"React to this. What does it mean tactically? Keep it under 2 sentences."
-                    )
-                else:
-                    prompt = prompts[tick % len(prompts)]
-
-                try:
-                    async with _gemini_send_lock:
-                        await asyncio.wait_for(
-                            agent.llm.simple_response(text=prompt),
-                            timeout=12.0,
-                        )
-                    _update_status(last_commentary=time.time())
-                    logger.info("🎙️ Commentary tick #%d delivered", tick)
-                except asyncio.TimeoutError:
-                    logger.debug("Commentary tick #%d timed out", tick)
-                except Exception as e:
-                    err_str = str(e)
-                    if "1008" in err_str or "1011" in err_str or "ConnectionClosed" in type(e).__name__:
-                        _backoff_until = time.time() + 25
-                        logger.warning(
-                            "🔴 Gemini crash (%s) — backing off 25s (tick #%d)",
-                            type(e).__name__, tick,
-                        )
-                    else:
-                        logger.debug("Commentary tick #%d failed: %s", tick, e)
+                prompt = prompts[tick % len(prompts)]
             else:
-                # No players visible — stay silent, don't describe empty/pixelated frames
-                pass
+                # ── Mode 2: YOLO can't see players — vision-only fallback ──
+                # Gemini still receives full video at 5 FPS. Use it.
+                prompts = [
+                    (
+                        "Look at the screen right now and describe what's happening "
+                        "in the match. One sentence of live commentary."
+                    ),
+                    (
+                        "What's the current state of play? Describe what you see "
+                        "on the broadcast. Keep it to one energetic sentence."
+                    ),
+                    (
+                        "Give a quick observation about what's happening on screen "
+                        "right now. What would the viewer want to know? One sentence."
+                    ),
+                ]
+                prompt = prompts[tick % len(prompts)]
+
+            await _send_to_gemini(agent, prompt, f"Commentary tick #{tick}")
 
         except asyncio.CancelledError:
             logger.info("🎙️ Commentary loop cancelled")
@@ -565,65 +722,46 @@ async def _commentary_loop(agent: Agent, sports: SportsProcessor) -> None:
             else:
                 logger.debug("Commentary loop error: %s", e)
 
-        # Wait a consistent 15 seconds between proactive commentary ticks
+        # Consistent 15s between ticks
         await asyncio.sleep(15)
 
 
-# ── Independent Question Loop ──────────────────────────────────────────
+# ── Backup Question Loop ────────────────────────────────────────────────
 async def _question_loop(agent: Agent) -> None:
     """
-    Independent loop that checks for user text questions every 3 seconds.
-    Runs separately from commentary so questions get answered faster.
-    Uses the same send lock to prevent concurrent Gemini sends.
+    Backup loop that catches any questions the commentary loop didn't handle.
+    Questions are primarily answered inside _commentary_loop (priority check),
+    but this loop catches edge cases like backoff periods or timing gaps.
+    Checks every 12 seconds — staggered from commentary's 15s cycle.
     """
     global _backoff_until
-    await asyncio.sleep(10)  # Let agent settle before accepting questions
-    logger.info("❓ Question loop started — checking every 3s")
+    await asyncio.sleep(18)  # Start after commentary loop is active
+    logger.info("❓ Backup question loop started — checking every 12s")
 
     while True:
         try:
-            # Respect backoff from Gemini crashes
             if time.time() < _backoff_until:
-                await asyncio.sleep(8)
+                await asyncio.sleep(12)
                 continue
 
             questions = _safe_read_json(QUESTIONS_FILE, fallback=[])
             pending = [q for q in questions if not q.get("answered")]
-            for q in pending:
+            if pending:
+                q = pending[0]  # Handle one at a time
                 q["answered"] = True
                 user = q.get("user", "Fan")
                 question_text = q.get("question", "")
-                logger.info("❓ Answering question from %s: %s", user, question_text)
+                logger.info("❓ Backup answering question from %s: %s", user, question_text)
                 await _append_transcript(question_text, source="user")
 
                 prompt = (
                     f"[USER QUESTION from {user}]: \"{question_text}\"\n"
                     f"Answer this question directly and helpfully. "
-                    f"If it's about the game, use what you see on screen. "
-                    f"If it's about stats or players, give your best answer. "
+                    f"If it's about the game, use what you see on screen "
+                    f"and the HUD data. "
                     f"Keep it under 3 sentences."
                 )
-                try:
-                    async with _gemini_send_lock:
-                        await asyncio.wait_for(
-                            agent.llm.simple_response(text=prompt),
-                            timeout=12.0,
-                        )
-                    _update_status(last_commentary=time.time())
-                    logger.info("✅ Answered question from %s", user)
-                except asyncio.TimeoutError:
-                    logger.debug("Question answer timed out for: %s", question_text)
-                except Exception as e:
-                    err_str = str(e)
-                    if "1008" in err_str or "1011" in err_str or "ConnectionClosed" in type(e).__name__:
-                        _backoff_until = time.time() + 25
-                        logger.warning(
-                            "🔴 Gemini crash in question loop — backing off 25s"
-                        )
-                    else:
-                        logger.debug("Question answer failed: %s", e)
-
-            if pending:
+                await _send_to_gemini(agent, prompt, f"Question from {user}")
                 _safe_write_json(QUESTIONS_FILE, questions)
         except asyncio.CancelledError:
             logger.info("❓ Question loop cancelled")
@@ -631,40 +769,27 @@ async def _question_loop(agent: Agent) -> None:
         except Exception as e:
             logger.debug("Question check error: %s", e)
 
-        await asyncio.sleep(8)
+        await asyncio.sleep(12)
 
 
-# ── Transcript Capture Hook ────────────────────────────────────────────
+# ── Transcript Capture via SDK Events ────────────────────────────────────
 def _setup_transcript_capture(agent: Agent) -> None:
-    """Hook into agent transcript events to capture what the AI says."""
-    original_on_agent_transcript = None
-
-    # Try to hook the standard transcript callback
+    """
+    Subscribe to the SDK's proper event system to capture agent speech.
+    Uses agent.llm.events.subscribe with type-hinted async handlers.
+    User speech is NEVER captured — privacy first.
+    """
     try:
-        # Vision Agents SDK emits transcript events we can listen to
-        if hasattr(agent, 'on'):
-            @agent.on('agent_transcript')
-            async def _on_transcript(text: str, **kw: Any) -> None:
-                await _append_transcript(text, source="agent")
+        @agent.llm.events.subscribe
+        async def _on_agent_speech(
+            event: RealtimeAgentSpeechTranscriptionEvent,
+        ) -> None:
+            if event.text:
+                await _buffer_chunk(event.text)
 
-            # NOTE: We intentionally do NOT hook user_transcript.
-            # User voice/speech is never collected, stored, or logged — privacy first.
-    except Exception:
-        pass
-
-    # Also hook the LLM transcript if available
-    try:
-        if hasattr(agent.llm, '_on_agent_transcript'):
-            original_on_agent_transcript = agent.llm._on_agent_transcript
-
-            async def _patched_transcript(text: str, **kw: Any) -> None:
-                await _append_transcript(text, source="agent")
-                if original_on_agent_transcript:
-                    await original_on_agent_transcript(text, **kw)
-
-            agent.llm._on_agent_transcript = _patched_transcript
-    except Exception:
-        pass
+        logger.info("🎙️ Transcript capture hooked via SDK events")
+    except Exception as e:
+        logger.warning("Transcript capture setup failed: %s", e)
 
 
 # ── Call Lifecycle ──────────────────────────────────────────────────────
@@ -712,13 +837,15 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
 
         logger.info("PlayByt is live — starting commentary loop...")
 
-        # Start the proactive commentary loop alongside the forever-block
+        # Start commentary + event watcher + question loops
         commentary_task = None
         question_task = None
+        event_task = None
         if sports:
             commentary_task = asyncio.ensure_future(_commentary_loop(agent, sports))
+            event_task = asyncio.ensure_future(_event_watcher(agent, sports))
             question_task = asyncio.ensure_future(_question_loop(agent))
-            logger.info("🎙️ Commentary + question loops scheduled")
+            logger.info("🎙️ Commentary + event watcher + question loops scheduled")
         else:
             logger.warning("No SportsProcessor found — commentary loop disabled")
 
@@ -728,12 +855,13 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
         except asyncio.CancelledError:
             pass
         finally:
-            if commentary_task:
-                commentary_task.cancel()
-                await asyncio.gather(commentary_task, return_exceptions=True)
-            if question_task:
-                question_task.cancel()
-                await asyncio.gather(question_task, return_exceptions=True)
+            for task in (commentary_task, event_task, question_task):
+                if task:
+                    task.cancel()
+            await asyncio.gather(
+                *(t for t in (commentary_task, event_task, question_task) if t),
+                return_exceptions=True,
+            )
             _update_status(gemini="disconnected", commentary_loop="stopped")
             logger.info("Agent session cancelled — shutting down.")
 

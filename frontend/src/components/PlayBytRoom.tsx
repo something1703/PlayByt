@@ -203,6 +203,21 @@ export function PlayBytRoom({ config, onLeave }: PlayBytRoomProps) {
     ])
   }
 
+  function removeCommentaryById(id: number) {
+    setCommentary(prev => prev.filter(c => c.id !== id))
+  }
+
+  function addCommentaryWithId(id: number, line: Omit<CommentaryLine, 'id' | 'time'>) {
+    setCommentary(prev => [
+      ...prev,
+      {
+        ...line,
+        id,
+        time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      },
+    ])
+  }
+
   if (!client || !call) {
     return (
       <div style={{
@@ -235,6 +250,8 @@ export function PlayBytRoom({ config, onLeave }: PlayBytRoomProps) {
           config={config}
           commentary={commentary}
           addCommentary={addCommentary}
+          removeCommentaryById={removeCommentaryById}
+          addCommentaryWithId={addCommentaryWithId}
           onLeave={onLeave}
         />
       </StreamCall>
@@ -248,6 +265,8 @@ interface RoomLayoutProps {
   config: RoomConfig
   commentary: CommentaryLine[]
   addCommentary: (line: Omit<CommentaryLine, 'id' | 'time'>) => void
+  removeCommentaryById: (id: number) => void
+  addCommentaryWithId: (id: number, line: Omit<CommentaryLine, 'id' | 'time'>) => void
   onLeave: () => void
 }
 
@@ -257,7 +276,7 @@ function formatUptime(seconds: number): string {
   return `${m}:${s}`
 }
 
-function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutProps) {
+function RoomLayout({ config, commentary, addCommentary, removeCommentaryById, addCommentaryWithId, onLeave }: RoomLayoutProps) {
   const call = useCall()
   const { useParticipants, useCallCallingState } = useCallStateHooks()
   const participants = useParticipants()
@@ -281,6 +300,8 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
   const prevParticipantCount = useRef(participants.length)
   const lastKnownAgentParticipant = useRef<typeof participants[0] | null>(null)
   const lastTranscriptId = useRef(0)
+  // ID of the local "PlayByt is thinking…" placeholder — cleared when the real answer arrives
+  const pendingThinkingId = useRef<number | null>(null)
   // Stable waveform heights — updated via interval, not in render
   const [waveHeights, setWaveHeights] = useState([8, 12, 16, 10, 14])
 
@@ -353,6 +374,13 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
           lines.forEach(line => {
             if (line.id > lastTranscriptId.current) {
               lastTranscriptId.current = line.id
+              // If a thinking placeholder is showing and the agent just spoke,
+              // remove the placeholder before adding the real answer
+              if (pendingThinkingId.current !== null && line.source === 'agent') {
+                const thinkingId = pendingThinkingId.current
+                pendingThinkingId.current = null
+                removeCommentaryById(thinkingId)
+              }
               addRef.current({
                 type: line.source === 'agent' ? 'playbyt' : 'user',
                 text: line.text,
@@ -1107,7 +1135,16 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
               flexDirection: 'column',
               gap: '6px',
             }}>
-              <style>{`@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }`}</style>
+              <style>{`
+                @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+                @keyframes thinkingPulse {
+                  0%, 80%, 100% { opacity: 0.2; transform: scale(0.8); }
+                  40% { opacity: 1; transform: scale(1.1); }
+                }
+                .thinking-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: #00ff88; margin: 0 2px; animation: thinkingPulse 1.4s ease-in-out infinite; }
+                .thinking-dot:nth-child(2) { animation-delay: 0.2s; }
+                .thinking-dot:nth-child(3) { animation-delay: 0.4s; }
+              `}</style>
               {commentary.map(line => (
                 <div key={line.id} style={{
                   background: line.type === 'playbyt'
@@ -1138,9 +1175,17 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
                     </span>
                     <span style={{ fontSize: '9px', color: 'var(--text-secondary)' }}>{line.time}</span>
                   </div>
-                  <p style={{ fontSize: '12px', color: 'var(--text-primary)', lineHeight: '1.4' }}>
-                    {line.text}
-                  </p>
+                  {line.text === '…' ? (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '2px', padding: '4px 0' }}>
+                      <span className="thinking-dot" />
+                      <span className="thinking-dot" />
+                      <span className="thinking-dot" />
+                    </div>
+                  ) : (
+                    <p style={{ fontSize: '12px', color: 'var(--text-primary)', lineHeight: '1.4' }}>
+                      {line.text}
+                    </p>
+                  )}
                 </div>
               ))}
             </div>
@@ -1156,8 +1201,16 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
                   const msg = chatInput.trim()
                   if (!msg) return
                   setChatInput('')
-                  // Send question to backend — it will appear in the Live Feed
-                  // via transcript polling (no local addCommentary to avoid duplicates)
+
+                  // Show the user's question immediately in the Live Feed
+                  addRef.current({ type: 'user', text: msg, user: config.userName })
+
+                  // Show a "thinking" placeholder so the user knows it was received
+                  // The transcript poller will remove it when the agent answers
+                  const thinkingId = ++commentaryIdCounter
+                  pendingThinkingId.current = thinkingId
+                  addCommentaryWithId(thinkingId, { type: 'playbyt', text: '…' })
+
                   try {
                     await fetch(`${API_BASE}/api/ask`, {
                       method: 'POST',
@@ -1165,8 +1218,9 @@ function RoomLayout({ config, commentary, addCommentary, onLeave }: RoomLayoutPr
                       body: JSON.stringify({ question: msg, user: config.userName }),
                     })
                   } catch {
-                    // If backend unreachable, show locally as fallback
-                    addRef.current({ type: 'user', text: msg, user: config.userName })
+                    // Backend unreachable — remove thinking placeholder
+                    pendingThinkingId.current = null
+                    removeCommentaryById(thinkingId)
                   }
                 }}
                 style={{ display: 'flex', gap: '6px' }}

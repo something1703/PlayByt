@@ -113,6 +113,10 @@ class SportsProcessor(VideoProcessorPublisher):
         self._consecutive_errors: int = 0
         self._MAX_CONSECUTIVE_ERRORS: int = 20  # Stop logging after 20 in a row
 
+        # Event queue — controversies are pushed here for the commentary loop
+        # to fire IMMEDIATELY instead of waiting for the next timer tick.
+        self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
+
         # Clear stale files on boot
         try:
             ANALYSIS_FILE.write_text("{}")
@@ -517,6 +521,11 @@ class SportsProcessor(VideoProcessorPublisher):
                 alert["timestamp"] = now
                 self._controversies.append(alert)
                 self._last_alert_time[alert["type"]] = now
+                # Push to event queue for immediate commentary (non-blocking)
+                try:
+                    self._event_queue.put_nowait(alert)
+                except asyncio.QueueFull:
+                    pass  # Drop oldest — commentary will catch up
             asyncio.ensure_future(self._persist_controversies())
 
         # Update prev state
