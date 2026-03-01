@@ -47,7 +47,11 @@ def _safe_read_json(path: Path, fallback=None):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://playbyt-i9ae.vercel.app",
+        "http://localhost:5173",  # local dev
+        "http://localhost:4173",  # local preview
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -1,0 +1,32 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+
+# Local env — secrets come from Cloud Run env vars
+.env
+
+# Frontend (not deployed here)
+frontend/
+
+# Runtime temp files
+.analysis.json
+.controversies.json
+.questions.json
+.status.json
+.transcript.json
+.highlights.json
+.report.json
+.call_id
+.frame_buffer.json
+.summary_card.json
+
+# Docs
+*.md
+IDEA.md
+ROADMAP.md
+SETUP.md
+
+.DS_Store
