@@ -103,6 +103,25 @@ REPORT_FILE = Path(__file__).parent / ".report.json"
 TRANSCRIPT_FILE = Path(__file__).parent / ".transcript.json"
 STATUS_FILE = Path(__file__).parent / ".status.json"
 QUESTIONS_FILE = Path(__file__).parent / ".questions.json"
+PRESENCE_FILE = Path(__file__).parent / ".presence.json"
+
+# ── Presence Timeout ────────────────────────────────────────────────
+# How long to keep running after the last frontend heartbeat.
+# Frontend pings /api/presence every 20s. If no ping for 90s → room empty.
+_PRESENCE_TIMEOUT = 90.0
+
+
+def _room_has_users() -> bool:
+    """Return True if at least one user is actively in the room.
+    The frontend POSTs /api/presence every 20s while a user is connected.
+    If no heartbeat for 90 seconds we treat the room as empty and skip
+    sending to Gemini — avoiding burning API credits when nobody is watching.
+    """
+    data = _safe_read_json(PRESENCE_FILE, fallback=None)
+    if not data:
+        return False
+    last_seen = data.get("last_seen", 0)
+    return (time.time() - last_seen) < _PRESENCE_TIMEOUT
 
 # ── Game State ──────────────────────────────────────────────────────────
 game_state: dict = {
@@ -568,6 +587,10 @@ async def _event_watcher(agent: Agent, sports: SportsProcessor) -> None:
             if time.time() < _backoff_until:
                 continue
 
+            # Don't fire alerts into an empty room
+            if not _room_has_users():
+                continue
+
             prompt = (
                 f"[REAL-TIME ALERT] {alert['title']}: {alert['description']}. "
                 f"This JUST happened on screen. React immediately — what does this mean "
@@ -609,6 +632,12 @@ async def _commentary_loop(agent: Agent, sports: SportsProcessor) -> None:
             # Skip tick if recovering from a Gemini WebSocket crash
             if time.time() < _backoff_until:
                 logger.debug("Commentary tick #%d skipped (backoff)", tick)
+                await asyncio.sleep(15)
+                continue
+
+            # Skip tick if nobody is in the room — don't burn Gemini credits idle
+            if not _room_has_users():
+                logger.debug("Commentary tick #%d skipped (room empty)", tick)
                 await asyncio.sleep(15)
                 continue
 

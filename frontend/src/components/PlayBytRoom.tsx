@@ -408,6 +408,17 @@ function RoomLayout({ config, commentary, addCommentary, removeCommentaryById, a
     return () => clearInterval(poll)
   }, [])
 
+  // Presence heartbeat — tells the agent the room is occupied every 20s.
+  // Agent pauses Gemini commentary 90s after last heartbeat (saves API credits).
+  useEffect(() => {
+    // Fire immediately on mount so the agent activates right away
+    fetch(`${API_BASE}/api/presence`, { method: 'POST' }).catch(() => {})
+    const heartbeat = setInterval(() => {
+      fetch(`${API_BASE}/api/presence`, { method: 'POST' }).catch(() => {})
+    }, 20000)
+    return () => clearInterval(heartbeat)
+  }, [])
+
   // Waveform animation — update heights in an interval, NOT in render
   useEffect(() => {
     if (!agentSpeaking) return
