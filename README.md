@@ -4,6 +4,8 @@
 
 PlayByt is a multi-user AI sports analysis agent. Fans join a shared room, share a live sports broadcast, and get real-time AI analysis from an agent that **spots what the commentators miss** — tactical shifts, controversial decisions, and emerging patterns — with YOLO player tracking on every frame.
 
+###Deployed link - https://playbyt-i9ae.vercel.app/
+###Backend and Agent deployed on an EC2 instance at - https://54-208-69-71.sslip.io/
 ---
 
 ## What It Does
