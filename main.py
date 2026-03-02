@@ -55,6 +55,33 @@ def _patched_should_reconnect(exc: Exception) -> bool:
 _gemini_rt._should_reconnect = _patched_should_reconnect
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ── SDK monkey-patch: JPEG + resize for video frames ─────────────────────────
+# The default _send_video_frame converts frames to PNG with NO resizing.
+# A full-resolution screen share (e.g. 1920×1080) produces a multi-MB PNG that
+# exceeds the Gemini Live API per-message limit → server closes with 1008.
+# Patch to JPEG at 640×360 (≈15–40 KB) which stays well within the limit.
+from functools import partial as _partial
+from vision_agents.core.utils.video_utils import frame_to_jpeg_bytes as _frame_to_jpeg
+from google.genai.types import Blob as _Blob
+
+_VID_W, _VID_H, _VID_Q = 640, 360, 75  # target width, height, JPEG quality
+
+async def _patched_send_video_frame(self, frame):
+    loop = asyncio.get_running_loop()
+    jpeg_bytes = await loop.run_in_executor(
+        self._executor,
+        _partial(_frame_to_jpeg, frame, _VID_W, _VID_H, _VID_Q),
+    )
+    blob = _Blob(data=jpeg_bytes, mime_type="image/jpeg")
+    try:
+        await self._session.send_realtime_input(media=blob)
+    except Exception:
+        logger.exception("Failed to send a video frame to Gemini Live API")
+
+import types as _types
+_gemini_rt.GeminiRealtime._send_video_frame = _patched_send_video_frame
+# ──────────────────────────────────────────────────────────────────────────────
+
 # ── SDK monkey-patch: create_call ──────────────────────────────────────────────
 # The SDK's create_call passes data as a plain dict {"created_by_id": ...} which
 # the getstream REST client doesn't serialize the same way as a CallRequest
