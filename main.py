@@ -132,6 +132,61 @@ async def _patched_processing_loop(self):
 _gemini_rt.GeminiRealtime._processing_loop = _patched_processing_loop
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ── SDK monkey-patch: fix ParticipantLeftEvent not cleaning up video tracks ───
+# When a participant leaves, _on_track_removed in StreamEdge relies on
+# event.participant.published_tracks to find which tracks to remove.
+# The Stream SFU proto often sends this as an empty list, so no TrackRemovedEvent
+# is fired → Gemini keeps receiving video frames indefinitely, burning credits.
+# Fix: on ParticipantLeftEvent, scan the full _track_map for the leaving
+# participant and emit TrackRemovedEvent for every track that was published.
+import vision_agents.plugins.getstream.stream_edge_transport as _stream_edge
+from vision_agents.core.edge import events as _edge_events
+
+_orig_stream_on_track_removed = _stream_edge.StreamEdge._on_track_removed
+
+async def _patched_stream_on_track_removed(self, event):
+    if not event.payload:
+        return
+
+    # Determine user_id + session_id from whichever field is populated
+    if event.participant and event.participant.user_id:
+        user_id  = event.participant.user_id
+        session_id = event.participant.session_id
+    else:
+        user_id  = event.payload.user_id
+        session_id = event.payload.session_id
+
+    is_participant_left = not hasattr(event.payload, "type")
+
+    if is_participant_left:
+        # Scan _track_map for ALL published tracks belonging to this participant.
+        # Don't rely on event.participant.published_tracks — it's often empty.
+        for track_key, track_info in list(self._track_map.items()):
+            tk_user, tk_session, tk_type_int = track_key
+            if (tk_user == user_id and tk_session == session_id
+                    and track_info.get("published")):
+                track_type = _stream_edge._to_core_track_type(tk_type_int)
+                self.events.send(
+                    _edge_events.TrackRemovedEvent(
+                        plugin_name="getstream",
+                        track_id=track_info["track_id"],
+                        track_type=track_type,
+                        participant=_stream_edge._to_core_participant(event.participant),
+                    )
+                )
+                self._track_map[track_key]["published"] = False
+                logger.info(
+                    "🛑 Cleaned up track %s for departed participant %s",
+                    track_info["track_id"], user_id,
+                )
+        return  # handled — skip original
+
+    # For TrackUnpublishedEvent use the original logic
+    await _orig_stream_on_track_removed(self, event)
+
+_stream_edge.StreamEdge._on_track_removed = _patched_stream_on_track_removed
+# ──────────────────────────────────────────────────────────────────────────────
+
 # ── SDK monkey-patch: create_call ──────────────────────────────────────────────
 # The SDK's create_call passes data as a plain dict {"created_by_id": ...} which
 # the getstream REST client doesn't serialize the same way as a CallRequest
@@ -981,6 +1036,7 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
         commentary_task = None
         question_task = None
         event_task = None
+        video_guard_task = None
         if sports:
             commentary_task = asyncio.ensure_future(_commentary_loop(agent, sports))
             event_task = asyncio.ensure_future(_event_watcher(agent, sports))
@@ -989,17 +1045,40 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
         else:
             logger.warning("No SportsProcessor found — commentary loop disabled")
 
+        # Safety-net: stop Gemini video when room is empty even if SDK track
+        # removal event was missed (e.g. participant_left with empty published_tracks)
+        async def _video_guard():
+            """Kill video forwarding whenever the room has been empty for >30s."""
+            was_empty = False
+            empty_since = 0.0
+            while True:
+                await asyncio.sleep(10)
+                room_empty = not _room_has_users()
+                if room_empty and not was_empty:
+                    was_empty = True
+                    empty_since = time.time()
+                elif not room_empty:
+                    was_empty = False
+                    empty_since = 0.0
+                # Stop video after 30s of confirmed emptiness
+                if was_empty and (time.time() - empty_since) > 30:
+                    if getattr(agent.llm, "_video_forwarder", None) is not None:
+                        await agent.llm.stop_watching_video_track()
+                        logger.info("🛑 Video guard: stopped Gemini video (room empty >30s)")
+
+        video_guard_task = asyncio.ensure_future(_video_guard())
+
         _shutdown = asyncio.Event()
         try:
             await _shutdown.wait()  # Block until cancelled — cleaner than Future()
         except asyncio.CancelledError:
             pass
         finally:
-            for task in (commentary_task, event_task, question_task):
+            for task in (commentary_task, event_task, question_task, video_guard_task):
                 if task:
                     task.cancel()
             await asyncio.gather(
-                *(t for t in (commentary_task, event_task, question_task) if t),
+                *(t for t in (commentary_task, event_task, question_task, video_guard_task) if t),
                 return_exceptions=True,
             )
             _update_status(gemini="disconnected", commentary_loop="stopped")
