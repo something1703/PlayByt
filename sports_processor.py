@@ -117,6 +117,10 @@ class SportsProcessor(VideoProcessorPublisher):
         # to fire IMMEDIATELY instead of waiting for the next timer tick.
         self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=10)
 
+        # Timestamp of the most recent video frame received — used by the
+        # commentary loop to detect when screen share has stopped.
+        self.last_frame_time: float = 0.0
+
         # Clear stale files on boot
         try:
             ANALYSIS_FILE.write_text("{}")
@@ -175,6 +179,7 @@ class SportsProcessor(VideoProcessorPublisher):
             return
 
         self._frame_count += 1
+        self.last_frame_time = time.time()  # track when we last received a frame
 
         # Step 1: Decode frame
         try:
@@ -250,6 +255,9 @@ class SportsProcessor(VideoProcessorPublisher):
             await self._video_forwarder.remove_frame_handler(self._process_frame)
             self._video_forwarder = None
             logger.info("🛑 Sports Intelligence processing stopped")
+        # Reset so commentary loop knows video is gone
+        self.last_frame_time = 0.0
+        self.latest_analysis = {}
 
     async def close(self) -> None:
         """Clean up resources."""

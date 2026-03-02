@@ -731,6 +731,10 @@ async def _event_watcher(agent: Agent, sports: SportsProcessor) -> None:
             if not _room_has_users():
                 continue
 
+            # Don't fire alerts if screen share is gone
+            if sports.last_frame_time == 0.0 or (time.time() - sports.last_frame_time) > 30:
+                continue
+
             prompt = (
                 f"[REAL-TIME ALERT] {alert['title']}: {alert['description']}. "
                 f"This JUST happened on screen. React immediately — what does this mean "
@@ -778,6 +782,15 @@ async def _commentary_loop(agent: Agent, sports: SportsProcessor) -> None:
             # Skip tick if nobody is in the room — don't burn Gemini credits idle
             if not _room_has_users():
                 logger.debug("Commentary tick #%d skipped (room empty)", tick)
+                await asyncio.sleep(15)
+                continue
+
+            # Skip tick if no video frames have arrived in the last 30s —
+            # screen share has stopped or hasn't started yet.
+            # Avoids agent commenting on a frozen/last frame after share ends.
+            video_age = time.time() - sports.last_frame_time
+            if sports.last_frame_time == 0.0 or video_age > 30:
+                logger.debug("Commentary tick #%d skipped (no video — last frame %.0fs ago)", tick, video_age)
                 await asyncio.sleep(15)
                 continue
 

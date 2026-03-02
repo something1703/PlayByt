@@ -284,7 +284,6 @@ function RoomLayout({ config, commentary, addCommentary, removeCommentaryById, a
   const commentaryRef = useRef<HTMLDivElement>(null)
   const [isMuted, setIsMuted] = useState(false)
   const [isCamOff, setIsCamOff] = useState(false)
-  const [isScreenSharing, setIsScreenSharing] = useState(false)
   const [elapsed, setElapsed] = useState(0)
   const [agentSpeaking, setAgentSpeaking] = useState(false)
   const [highlights, setHighlights] = useState<Highlight[]>([])
@@ -509,7 +508,7 @@ function RoomLayout({ config, commentary, addCommentary, removeCommentaryById, a
     } else {
       await call?.screenShare.enable()
     }
-    setIsScreenSharing(!isScreenSharing)
+    // No need to set state — isScreenSharing is derived from SDK participant state
   }
 
   async function exportReport() {
@@ -543,6 +542,9 @@ function RoomLayout({ config, commentary, addCommentary, removeCommentaryById, a
   const effectiveAgentParticipant = agentParticipant ?? lastKnownAgentParticipant.current
   // Screen-sharing participant (could be anyone)
   const screenShareParticipant = participants.find(p => hasScreenShare(p))
+  // Derive from actual SDK state — syncs with browser's native 'Stop sharing' button too
+  const localParticipant = participants.find(p => p.isLocalParticipant)
+  const isScreenSharing = !!(localParticipant && hasScreenShare(localParticipant))
   // Other human participants (exclude agent, screen share, and local user since they're in the split view)
   const humanParticipants = participants.filter(p =>
     !p.userId?.startsWith('playbyt') &&
