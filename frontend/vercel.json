@@ -1,8 +1,12 @@
 {
-  "rewrites": [
+  "routes": [
     {
-      "source": "/api/:path*",
-      "destination": "http://54.208.69.71:8000/api/:path*"
+      "src": "/api/(.*)",
+      "dest": "http://54.208.69.71:8000/api/$1"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/index.html"
     }
   ]
 }
